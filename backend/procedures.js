@@ -214,60 +214,26 @@ export function transactionPatientOnboarding(patientData, appointmentData) {
 // Protected by Oracle Triggers: trg_inventory_auto_decrement & trg_appt_completion_guard
 // ===========================================================
 export function transactionConsultationPrescription(apptId, diagnosis, prescriptions) {
-  const appt = queryOne('SELECT * FROM appointment WHERE appt_id = ? AND status = ?', [apptId, 'Scheduled']);
-  if (!appt) throw new Error('Appointment not found or not in Scheduled status.');
-
-  if (!prescriptions || !Array.isArray(prescriptions) || prescriptions.length === 0) {
+  if (!Array.isArray(prescriptions) || prescriptions.length === 0) {
     throw new Error('At least one prescription is required to complete consultation.');
   }
-
-  // --- Validate all prescriptions first (read‑only) ---
-  const stockResults = [];
-  for (const presc of prescriptions) {
-    // This call only checks stock; it does NOT modify the database.
-    const stockResult = triggerInventoryDecrement(presc.medicine_id, presc.quantity);
-    stockResults.push({ presc, stockResult });
-  }
-
-  // Begin transaction; trigger will decrement stock automatically on INSERT
-  beginTransaction();
-  const logs = [];
-  try {
-    logs.push({ step: 'Transaction Begin', table: 'SYSTEM', operation: 'BEGIN TRANSACTION', detail: 'Started atomic consultation transaction in Oracle' });
-    logs.push({ step: 'Appointment Verification', table: 'APPOINTMENT', operation: 'SELECT', detail: `Appointment #${apptId} verified` });
-
-    // Insert each prescription; trigger will handle stock decrement.
-    for (const { presc, stockResult } of stockResults) {
-      runSql('INSERT INTO prescription (appt_id, medicine_id, dosage, duration_days, quantity) VALUES (?, ?, ?, ?, ?)',
-        [apptId, presc.medicine_id, presc.dosage, presc.duration_days, presc.quantity]);
-      logs.push({
-        step: 'Prescription Added',
-        table: 'PRESCRIPTION',
-        operation: 'INSERT',
-        detail: `Medicine ${stockResult.med_name} prescribed, quantity ${presc.quantity}`
-      });
-    }
-
-    // Update appointment status
-    runSql('UPDATE appointment SET status = ?, diagnosis = ? WHERE appt_id = ?', ['Completed', diagnosis, apptId]);
-    logs.push({
-      step: 'Appointment Completed',
-      table: 'APPOINTMENT',
-      operation: 'UPDATE',
-      detail: `Status → Completed, Diagnosis: ${diagnosis}`,
-      trigger: 'Trigger 2: trg_appt_completion_guard (passed)'
-    });
-
-    commitTransaction();
-    logs.push({ step: 'Transaction Commit', table: 'SYSTEM', operation: 'COMMIT', detail: 'Consultation transaction committed to Oracle Database' });
-    return { appt_id: apptId, logs };
-  } catch (err) {
-    rollbackTransaction();
-    throw new Error(`Consultation transaction failed and was rolled back in Oracle: ${err.message}`);
-  }
+  const escapeXml = value => String(value ?? '').replace(/[&<>"']/g, char => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;'
+  }[char]));
+  const itemsXml = '<prescriptions>' + prescriptions.map(item =>
+    '<item><medicine_id>' + escapeXml(item.medicine_id) + '</medicine_id>' +
+    '<dosage>' + escapeXml(item.dosage) + '</dosage>' +
+    '<duration_days>' + escapeXml(item.duration_days) + '</duration_days>' +
+    '<quantity>' + escapeXml(item.quantity) + '</quantity></item>'
+  ).join('') + '</prescriptions>';
+  callProcedure('txn_consultation_prescription', [apptId, diagnosis || null, itemsXml]);
+  return { appt_id: apptId, logs: [
+    { step: 'Consultation Procedure', table: 'PRESCRIPTION, MEDICINE, APPOINTMENT', operation: 'PL/SQL',
+      detail: `${prescriptions.length} prescriptions saved and appointment completed by txn_consultation_prescription`,
+      trigger: 'Inventory deduction and completion guard' },
+    { step: 'Transaction Commit', table: 'SYSTEM', operation: 'COMMIT', detail: 'Consultation committed by Oracle; failures roll back the entire procedure' }
+  ] };
 }
-
-
 
 // ============================================================
 // TRANSACTION 3: Automated Billing & Payment Processing
@@ -300,38 +266,15 @@ export function transactionBillingPayment(apptId) {
 // TRANSACTION 4: Inventory Restock & Price Adjustment
 // ============================================================
 export function transactionInventoryRestock(medicineId, addQty, newPrice) {
-  const med = queryOne('SELECT * FROM medicine WHERE medicine_id = ?', [medicineId]);
-  if (!med) throw new Error(`Medicine ${medicineId} not found.`);
-
-  beginTransaction();
-  try {
-    const logs = [];
-    logs.push({ step: 'Transaction Begin', table: 'SYSTEM', operation: 'BEGIN TRANSACTION', detail: 'Started inventory restock transaction in Oracle' });
-
-    const updates = [];
-    if (addQty && addQty > 0) {
-      runSql('UPDATE medicine SET stock_qty = stock_qty + ? WHERE medicine_id = ?', [addQty, medicineId]);
-      updates.push(`Stock: ${med.stock_qty} → ${med.stock_qty + addQty}`);
-    }
-    if (newPrice && newPrice > 0) {
-      runSql('UPDATE medicine SET unit_price = ? WHERE medicine_id = ?', [newPrice, medicineId]);
-      updates.push(`Price: ₹${med.unit_price} → ₹${newPrice}`);
-    }
-    logs.push({ step: 'Inventory Updated', table: 'MEDICINE', operation: 'UPDATE', detail: updates.join(', ') });
-
-    const updated = queryOne('SELECT * FROM medicine WHERE medicine_id = ?', [medicineId]);
-    if (updated.stock_qty < 50) {
-      logs.push({ step: 'Low Stock Alert', table: 'MEDICINE', operation: 'ALERT', detail: `⚠ ${updated.med_name} stock is low: ${updated.stock_qty} units` });
-    }
-
-    commitTransaction();
-    logs.push({ step: 'Transaction Commit', table: 'SYSTEM', operation: 'COMMIT', detail: 'Restock committed to Oracle Database' });
-
-    return { medicine: updated, logs };
-  } catch (err) {
-    rollbackTransaction();
-    throw new Error(`Restock transaction failed and was rolled back in Oracle: ${err.message}`);
-  }
+  callProcedure('txn_inventory_restock', [medicineId, addQty ?? null, newPrice ?? null]);
+  const medicine = queryOne('SELECT * FROM medicine WHERE medicine_id = ?', [medicineId]);
+  const logs = [
+    { step: 'Inventory Procedure', table: 'MEDICINE', operation: 'PL/SQL',
+      detail: `${medicine.med_name}: stock ${medicine.stock_qty}, price ${medicine.unit_price}; updated by txn_inventory_restock` },
+    { step: 'Transaction Commit', table: 'SYSTEM', operation: 'COMMIT', detail: 'Restock and price adjustment committed together by Oracle' }
+  ];
+  if (medicine.stock_qty < 50) logs.push({ step: 'Low Stock Alert', table: 'MEDICINE', operation: 'ALERT', detail: `${medicine.med_name}: ${medicine.stock_qty} units remaining` });
+  return { medicine, logs };
 }
 
 // ============================================================

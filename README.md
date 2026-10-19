@@ -171,3 +171,6 @@ javac -encoding UTF-8 -cp "C:/oraclexe/app/oracle/product/11.2.0/server/jdbc/lib
 ```
 
 The bridge launch JAR path is in `backend/database.js`. Oracle XE and the `hms` database user must already exist. `npm run seed` recreates the project tables and replaces their data; run it only for initial setup or an intentional reset.
+
+
+Transactions 1–5 now have stored procedures in `backend/oracle_plsql.sql`. Transaction 2 accepts multiple prescriptions as XML (Oracle 11g XMLTABLE); its inserts fire the inventory trigger and its status update fires the completion guard. Transaction 4 validates and updates stock and price together. Both procedures commit on success and roll back on failure. JavaScript calls them through the JDBC bridge. After updating, apply `oracle_plsql.sql` to the existing database (without running the destructive seed), recompile Java, and restart the bridge and backend.

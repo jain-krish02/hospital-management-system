@@ -447,6 +447,21 @@ public class OracleServer {
                             long apptId = cstmt.getLong(11);
                             sendResponse(exchange, 200, "{\"patient_id\":" + patientId + ",\"appt_id\":" + apptId + "}");
                         }
+                    } else if ("txn_consultation_prescription".equals(lower)) {
+                        try (CallableStatement cstmt = conn.prepareCall("{call txn_consultation_prescription(?, ?, ?)}")) {
+                            cstmt.setLong(1, ((Number) params.get(0)).longValue());
+                            cstmt.setString(2, params.get(1) == null ? null : params.get(1).toString());
+                            String xml = params.get(2).toString();
+                            cstmt.setCharacterStream(3, new StringReader(xml), xml.length());
+                            cstmt.execute();
+                            sendResponse(exchange, 200, "{\"status\":\"committed\"}");
+                        }
+                    } else if ("txn_inventory_restock".equals(lower)) {
+                        try (CallableStatement cstmt = conn.prepareCall("{call txn_inventory_restock(?, ?, ?)}")) {
+                            bindParams(cstmt, params);
+                            cstmt.execute();
+                            sendResponse(exchange, 200, "{\"status\":\"committed\"}");
+                        }
                     } else if ("txn_billing_payment".equals(lower)) {
                         try (CallableStatement cstmt = conn.prepareCall("{call txn_billing_payment(?, ?, ?)}")) {
                             cstmt.setLong(1, ((Number) params.get(0)).longValue());

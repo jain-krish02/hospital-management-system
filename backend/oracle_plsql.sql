@@ -260,6 +260,58 @@ END;
 /
 
 -- ============================================================================
+-- TRANSACTION 2: Consultation & Prescription Processing
+-- One XML item per medicine; Oracle 11g XMLTABLE supports multiple prescriptions.
+-- Inventory and completion rules are enforced by the existing database triggers.
+-- ============================================================================
+CREATE OR REPLACE PROCEDURE txn_consultation_prescription(
+    p_appt_id IN NUMBER,
+    p_diagnosis IN VARCHAR2,
+    p_items_xml IN CLOB
+)
+IS
+    v_status APPOINTMENT.status%TYPE;
+    v_count NUMBER := 0;
+BEGIN
+    SELECT status INTO v_status FROM APPOINTMENT
+    WHERE appt_id = p_appt_id FOR UPDATE;
+    IF v_status != 'Scheduled' THEN
+        RAISE_APPLICATION_ERROR(-20008, 'Appointment must be Scheduled.');
+    END IF;
+    IF p_items_xml IS NULL THEN
+        RAISE_APPLICATION_ERROR(-20009, 'At least one prescription is required.');
+    END IF;
+    FOR item IN (
+        SELECT medicine_id, dosage, duration_days, quantity
+        FROM XMLTABLE('/prescriptions/item' PASSING XMLTYPE(p_items_xml)
+            COLUMNS medicine_id NUMBER PATH 'medicine_id',
+                    dosage VARCHAR2(60) PATH 'dosage',
+                    duration_days NUMBER PATH 'duration_days',
+                    quantity NUMBER PATH 'quantity')
+    ) LOOP
+        IF item.medicine_id IS NULL OR item.quantity IS NULL
+           OR item.quantity <= 0 OR item.quantity != TRUNC(item.quantity)
+           OR item.duration_days IS NULL OR item.duration_days <= 0
+           OR item.duration_days != TRUNC(item.duration_days) THEN
+            RAISE_APPLICATION_ERROR(-20010, 'Medicine, positive whole quantity and duration are required.');
+        END IF;
+        INSERT INTO PRESCRIPTION (appt_id, medicine_id, dosage, duration_days, quantity)
+        VALUES (p_appt_id, item.medicine_id, NVL(item.dosage, 'As prescribed'), item.duration_days, item.quantity);
+        v_count := v_count + 1;
+    END LOOP;
+    IF v_count = 0 THEN
+        RAISE_APPLICATION_ERROR(-20009, 'At least one prescription is required.');
+    END IF;
+    UPDATE APPOINTMENT SET status = 'Completed', diagnosis = p_diagnosis
+    WHERE appt_id = p_appt_id;
+    COMMIT;
+EXCEPTION WHEN OTHERS THEN
+    ROLLBACK;
+    RAISE;
+END;
+/
+
+-- ============================================================================
 -- TRANSACTION 3: Automated Billing & Payment Processing
 -- ============================================================================
 CREATE OR REPLACE PROCEDURE txn_billing_payment(
@@ -282,6 +334,40 @@ EXCEPTION
     WHEN OTHERS THEN
         ROLLBACK;
         RAISE;
+END;
+/
+
+-- ============================================================================
+-- TRANSACTION 4: Inventory Restock & Price Adjustment
+-- Stock and price changes succeed together or are rolled back together.
+-- ============================================================================
+CREATE OR REPLACE PROCEDURE txn_inventory_restock(
+    p_medicine_id IN NUMBER,
+    p_add_qty IN NUMBER,
+    p_new_price IN NUMBER
+)
+IS
+    v_stock MEDICINE.stock_qty%TYPE;
+BEGIN
+    IF p_add_qty IS NOT NULL AND (p_add_qty < 0 OR p_add_qty != TRUNC(p_add_qty)) THEN
+        RAISE_APPLICATION_ERROR(-20011, 'Restock quantity must be a non-negative whole number.');
+    END IF;
+    IF p_new_price IS NOT NULL AND p_new_price <= 0 THEN
+        RAISE_APPLICATION_ERROR(-20012, 'New price must be positive.');
+    END IF;
+    IF NVL(p_add_qty, 0) = 0 AND p_new_price IS NULL THEN
+        RAISE_APPLICATION_ERROR(-20013, 'Provide a restock quantity or a new price.');
+    END IF;
+    SELECT stock_qty INTO v_stock FROM MEDICINE
+    WHERE medicine_id = p_medicine_id FOR UPDATE;
+    UPDATE MEDICINE
+    SET stock_qty = stock_qty + NVL(p_add_qty, 0),
+        unit_price = NVL(p_new_price, unit_price)
+    WHERE medicine_id = p_medicine_id;
+    COMMIT;
+EXCEPTION WHEN OTHERS THEN
+    ROLLBACK;
+    RAISE;
 END;
 /
 
