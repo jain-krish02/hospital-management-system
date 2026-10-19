@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.idea/
+.env
+.env.*
+!.env.example
+*.class
+*.db
+*.db-journal
+*.log
+tmp/
+.rollback-check-*/
